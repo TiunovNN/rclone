@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsretry "github.com/aws/aws-sdk-go-v2/aws/retry"
 	v4signer "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -1149,6 +1150,7 @@ type Options struct {
 	BucketObjectLockEnabled     bool                 `config:"bucket_object_lock_enabled"`
 	ObjectLockSetAfterUpload    bool                 `config:"object_lock_set_after_upload"`
 	ObjectLockSupported         fs.Tristate          `config:"object_lock_supported"`
+	retryOperationAborted       bool
 }
 
 // Fs represents a remote s3 server
@@ -1285,6 +1287,9 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 		}
 		// If it is a timeout then we want to retry that
 		if awsError.ErrorCode() == "RequestTimeout" {
+			return true, err
+		}
+		if f.opt.retryOperationAborted && awsError.ErrorCode() == "OperationAborted" {
 			return true, err
 		}
 	}
@@ -1566,6 +1571,9 @@ func s3Connection(ctx context.Context, opt *Options, client *http.Client) (s3Cli
 		s3Opt.UsePathStyle = opt.ForcePathStyle
 		s3Opt.UseAccelerate = opt.UseAccelerateEndpoint
 		s3Opt.UseARNRegion = opt.UseARNRegion
+		if opt.retryOperationAborted {
+			s3Opt.Retryer = awsretry.AddWithErrorCodes(s3Opt.Retryer, "OperationAborted")
+		}
 		// FIXME maybe this should be a tristate so can default to DualStackEndpointStateUnset?
 		if opt.UseDualStack {
 			s3Opt.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateEnabled
@@ -1758,6 +1766,24 @@ func setQuirks(opt *Options, provider *Provider) {
 			opt.CopyCutoff = fs.SizeSuffix(*provider.Quirks.CopyCutoff)
 		}
 	}
+
+	// Set the upload cutoff if not manually set
+	// Check equality with strings as config values get round tripped via strings
+	if opt.UploadCutoff.String() == defaultUploadCutoff.String() {
+		if provider.Quirks.UploadCutoff != nil {
+			opt.UploadCutoff = fs.SizeSuffix(*provider.Quirks.UploadCutoff)
+		}
+	}
+
+	// Set the chunk size if not manually set
+	// Check equality with strings as config values get round tripped via strings
+	if opt.ChunkSize.String() == minChunkSize.String() {
+		if provider.Quirks.ChunkSize != nil {
+			opt.ChunkSize = fs.SizeSuffix(*provider.Quirks.ChunkSize)
+		}
+	}
+
+	opt.retryOperationAborted = provider.Quirks.RetryOperationAborted
 
 	// Clip the max upload parts to the quirk
 	if provider.Quirks.MaxUploadParts != nil {
@@ -4608,9 +4634,8 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	// calculate size of parts
 	chunkSize := f.opt.ChunkSize
 
-	// size can be -1 here meaning we don't know the size of the incoming file. We use ChunkSize
-	// buffers here (default 5 MiB). With a maximum number of parts (10,000) this will be a file of
-	// 48 GiB which seems like a not too unreasonable limit.
+	// size can be -1 here meaning we don't know the size of the incoming file. In that case the
+	// configured chunk size determines the maximum stream size together with the maximum part count.
 	if size == -1 {
 		warnStreamUpload.Do(func() {
 			fs.Logf(f, "Streaming uploads using chunk size %v will have maximum file size of %v",

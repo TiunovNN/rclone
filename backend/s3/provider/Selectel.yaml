@@ -15,4 +15,7 @@ endpoint:
   s3.kz-1.storage.selcloud.ru: Kazakhstan
   s3.uz-2.storage.selcloud.ru: Uzbekistan
 quirks:
+  chunk_size: 8388608
   list_url_encode: false
+  retry_operation_aborted: true
+  upload_cutoff: 0

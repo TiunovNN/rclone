@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"path"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,10 +23,12 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
+	"github.com/rclone/rclone/fs/chunksize"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/rclone/rclone/lib/bucket"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/pool"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/version"
@@ -46,6 +49,146 @@ func gz(t *testing.T, s string) string {
 func md5sum(t *testing.T, s string) string {
 	hash := md5.Sum([]byte(s))
 	return fmt.Sprintf("%x", hash)
+}
+
+func TestSelectelQuirks(t *testing.T) {
+	provider := loadProvider("Selectel")
+	require.NotNil(t, provider)
+	const selectelChunkSize = fs.SizeSuffix(8 * 1024 * 1024)
+
+	t.Run("Defaults", func(t *testing.T) {
+		opt := Options{
+			UploadCutoff:   defaultUploadCutoff,
+			ChunkSize:      minChunkSize,
+			MaxUploadParts: maxUploadParts,
+		}
+		setQuirks(&opt, provider)
+		assert.Equal(t, fs.SizeSuffix(0), opt.UploadCutoff)
+		assert.Equal(t, selectelChunkSize, opt.ChunkSize)
+		assert.Equal(t, maxUploadParts, opt.MaxUploadParts)
+		assert.True(t, opt.retryOperationAborted)
+	})
+
+	t.Run("Overrides", func(t *testing.T) {
+		const uploadCutoff = fs.SizeSuffix(64 << 20)
+		const chunkSize = fs.SizeSuffix(16 << 20)
+		opt := Options{
+			UploadCutoff: uploadCutoff,
+			ChunkSize:    chunkSize,
+		}
+		setQuirks(&opt, provider)
+		assert.Equal(t, uploadCutoff, opt.UploadCutoff)
+		assert.Equal(t, chunkSize, opt.ChunkSize)
+	})
+
+	t.Run("MaximumParts", func(t *testing.T) {
+		sizeAtLimit := int64(selectelChunkSize) * maxUploadParts
+		assert.Equal(t, selectelChunkSize, chunksize.Calculator("selectel", sizeAtLimit, maxUploadParts, selectelChunkSize))
+
+		sizeAboveLimit := sizeAtLimit + 1
+		got := chunksize.Calculator("selectel", sizeAboveLimit, maxUploadParts, selectelChunkSize)
+		parts := (sizeAboveLimit + int64(got) - 1) / int64(got)
+		assert.Greater(t, got, selectelChunkSize)
+		assert.LessOrEqual(t, parts, int64(maxUploadParts))
+	})
+}
+
+func TestShouldRetryOperationAborted(t *testing.T) {
+	ctx := context.Background()
+	err := &smithy.GenericAPIError{
+		Code:    "OperationAborted",
+		Message: "A conflicting conditional operation is currently in progress",
+		Fault:   smithy.FaultClient,
+	}
+
+	t.Run("Enabled", func(t *testing.T) {
+		f := &Fs{opt: Options{retryOperationAborted: true}}
+		retry, gotErr := f.shouldRetry(ctx, err)
+		assert.True(t, retry)
+		assert.ErrorIs(t, gotErr, err)
+	})
+
+	t.Run("Disabled", func(t *testing.T) {
+		f := &Fs{}
+		retry, gotErr := f.shouldRetry(ctx, err)
+		assert.False(t, retry)
+		assert.ErrorIs(t, gotErr, err)
+	})
+}
+
+func TestSelectelSDKRetryer(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 7
+	opt := &Options{
+		Provider:        "Selectel",
+		AccessKeyID:     "access-key",
+		SecretAccessKey: "secret-key",
+		Region:          "ru-1",
+		Endpoint:        "http://127.0.0.1:1",
+		UploadCutoff:    defaultUploadCutoff,
+		ChunkSize:       minChunkSize,
+		CopyCutoff:      maxSizeForCopy,
+	}
+	client := getClient(ctx, opt)
+	c, _, err := s3Connection(ctx, opt, client)
+	require.NoError(t, err)
+
+	retryer := c.Options().Retryer
+	require.NotNil(t, retryer)
+	assert.Equal(t, ci.LowLevelRetries, retryer.MaxAttempts())
+	assert.True(t, retryer.IsErrorRetryable(&smithy.GenericAPIError{
+		Code:    "OperationAborted",
+		Message: "conflict",
+		Fault:   smithy.FaultClient,
+	}))
+}
+
+func TestSelectelUploadPartRetriesOperationAborted(t *testing.T) {
+	ctx := context.Background()
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPut, r.Method)
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `<Error><Code>OperationAborted</Code><Message>A conflicting conditional operation is currently in progress</Message></Error>`)
+			return
+		}
+		w.Header().Set("ETag", `"uploaded"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := s3.New(s3.Options{
+		Region:           "ru-1",
+		BaseEndpoint:     aws.String(server.URL),
+		UsePathStyle:     true,
+		Credentials:      aws.AnonymousCredentials{},
+		RetryMaxAttempts: 1,
+		HTTPClient:       server.Client(),
+	})
+	f := &Fs{
+		opt:   Options{retryOperationAborted: true},
+		c:     client,
+		pacer: fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(time.Millisecond))),
+	}
+	bucket := "bucket"
+	key := "key"
+	uploadID := "upload-id"
+	w := &s3ChunkWriter{
+		f:                    f,
+		bucket:               &bucket,
+		key:                  &key,
+		uploadID:             &uploadID,
+		multiPartUploadInput: &s3.CreateMultipartUploadInput{},
+		o:                    &Object{fs: f, remote: key},
+	}
+
+	payload := []byte("payload")
+	n, err := w.WriteChunk(ctx, 0, bytes.NewReader(payload))
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(payload)), n)
+	assert.Equal(t, int32(2), attempts.Load())
 }
 
 func (f *Fs) InternalTestMetadata(t *testing.T) {
