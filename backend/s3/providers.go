@@ -36,6 +36,7 @@ type Quirks struct {
 	EtagIsNotMD5                *bool  `yaml:"etag_is_not_md5,omitempty"`
 	ObjectLockSupported         *bool  `yaml:"object_lock_supported,omitempty"`
 	RetryOperationAborted       bool   `yaml:"retry_operation_aborted,omitempty"`
+	RetryPutObject              bool   `yaml:"retry_put_object,omitempty"`
 	ChunkSize                   *int64 `yaml:"chunk_size,omitempty"`
 	CopyCutoff                  *int64 `yaml:"copy_cutoff,omitempty"`
 	UploadCutoff                *int64 `yaml:"upload_cutoff,omitempty"`

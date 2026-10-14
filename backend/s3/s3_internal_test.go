@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsretry "github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -67,6 +68,7 @@ func TestSelectelQuirks(t *testing.T) {
 		assert.Equal(t, selectelChunkSize, opt.ChunkSize)
 		assert.Equal(t, maxUploadParts, opt.MaxUploadParts)
 		assert.True(t, opt.retryOperationAborted)
+		assert.True(t, opt.retryPutObject)
 	})
 
 	t.Run("Overrides", func(t *testing.T) {
@@ -189,6 +191,104 @@ func TestSelectelUploadPartRetriesOperationAborted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(payload)), n)
 	assert.Equal(t, int32(2), attempts.Load())
+}
+
+func TestSelectelPutObjectRetries(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		response   string
+	}{
+		{
+			name:       "OperationAborted",
+			statusCode: http.StatusConflict,
+			response:   `<Error><Code>OperationAborted</Code><Message>conflict</Message></Error>`,
+		},
+		{
+			name:       "TooManyRequests",
+			statusCode: http.StatusTooManyRequests,
+			response:   `<Error><Code>SlowDown</Code><Message>slow down</Message></Error>`,
+		},
+		{
+			name:       "InternalServerError",
+			statusCode: http.StatusInternalServerError,
+			response:   `<Error><Code>InternalError</Code><Message>try again</Message></Error>`,
+		},
+		{
+			name: "NetworkError",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			const payload = "repeatable put object payload"
+			var attempts atomic.Int32
+			var bodies []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempt := attempts.Add(1)
+				if attempt == 1 && test.statusCode == 0 {
+					partial := make([]byte, 5)
+					_, err := io.ReadFull(r.Body, partial)
+					require.NoError(t, err)
+					bodies = append(bodies, string(partial))
+					conn, _, err := w.(http.Hijacker).Hijack()
+					require.NoError(t, err)
+					require.NoError(t, conn.Close())
+					return
+				}
+
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				bodies = append(bodies, string(body))
+				if attempt == 1 {
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(test.statusCode)
+					_, _ = io.WriteString(w, test.response)
+					return
+				}
+				w.Header().Set("ETag", `"uploaded"`)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			retryer := awsretry.NewStandard(func(opt *awsretry.StandardOptions) {
+				opt.MaxAttempts = 3
+				opt.Backoff = awsretry.BackoffDelayerFunc(func(int, error) (time.Duration, error) {
+					return 0, nil
+				})
+			})
+			client := s3.New(s3.Options{
+				Region:       "ru-1",
+				BaseEndpoint: aws.String(server.URL),
+				UsePathStyle: true,
+				Credentials:  aws.AnonymousCredentials{},
+				Retryer:      awsretry.AddWithErrorCodes(retryer, "OperationAborted"),
+				HTTPClient:   server.Client(),
+			})
+			f := &Fs{
+				opt: Options{
+					UseUnsignedPayload:    fs.Tristate{Value: true, Valid: true},
+					retryOperationAborted: true,
+					retryPutObject:        true,
+				},
+				c:     client,
+				pacer: fs.NewPacer(context.Background(), pacer.NewS3(pacer.MinSleep(time.Millisecond))),
+			}
+			o := &Object{fs: f, remote: "key"}
+			req := &s3.PutObjectInput{
+				Bucket:        aws.String("bucket"),
+				Key:           aws.String("key"),
+				ContentLength: aws.Int64(int64(len(payload))),
+			}
+
+			etag, _, _, err := o.uploadSinglepartPutObject(context.Background(), req, int64(len(payload)), bytes.NewBufferString(payload))
+			require.NoError(t, err)
+			assert.Equal(t, `"uploaded"`, etag)
+			assert.Equal(t, int32(2), attempts.Load())
+			require.Len(t, bodies, 2)
+			assert.Equal(t, payload, bodies[1])
+		})
+	}
 }
 
 func (f *Fs) InternalTestMetadata(t *testing.T) {

@@ -1151,6 +1151,7 @@ type Options struct {
 	ObjectLockSetAfterUpload    bool                 `config:"object_lock_set_after_upload"`
 	ObjectLockSupported         fs.Tristate          `config:"object_lock_supported"`
 	retryOperationAborted       bool
+	retryPutObject              bool
 }
 
 // Fs represents a remote s3 server
@@ -1784,6 +1785,7 @@ func setQuirks(opt *Options, provider *Provider) {
 	}
 
 	opt.retryOperationAborted = provider.Quirks.RetryOperationAborted
+	opt.retryPutObject = provider.Quirks.RetryPutObject
 
 	// Clip the max upload parts to the quirk
 	if provider.Quirks.MaxUploadParts != nil {
@@ -4923,7 +4925,6 @@ func (o *Object) uploadSinglepartPutObject(ctx context.Context, req *s3.PutObjec
 	if err != nil {
 		return etag, lastModified, nil, err
 	}
-	req.Body = io.NopCloser(in)
 	var options = []func(*s3.Options){}
 	if o.fs.opt.UseUnsignedPayload.Value {
 		options = append(options, s3.WithAPIOptions(
@@ -4931,10 +4932,21 @@ func (o *Object) uploadSinglepartPutObject(ctx context.Context, req *s3.PutObjec
 			v4signer.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware,
 		))
 	}
-	// Can't retry single part uploads as only have an io.Reader
-	options = append(options, func(s3opt *s3.Options) {
-		s3opt.RetryMaxAttempts = 1
-	})
+	if o.fs.opt.retryPutObject {
+		// The SDK can only retry a request body if it can seek back to the start.
+		// Hide Close on existing seekers so the transport can't release shared buffers.
+		if seeker, ok := in.(io.ReadSeeker); ok {
+			req.Body = struct{ io.ReadSeeker }{seeker}
+		} else {
+			req.Body = readers.NewRepeatableReader(in)
+		}
+	} else {
+		req.Body = io.NopCloser(in)
+		// Can't retry single part uploads as only have an io.Reader
+		options = append(options, func(s3opt *s3.Options) {
+			s3opt.RetryMaxAttempts = 1
+		})
+	}
 	var resp *s3.PutObjectOutput
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 		resp, err = o.fs.c.PutObject(ctx, req, options...)

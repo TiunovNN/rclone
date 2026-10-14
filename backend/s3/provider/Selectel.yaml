@@ -18,4 +18,5 @@ quirks:
   chunk_size: 8388608
   list_url_encode: false
   retry_operation_aborted: true
+  retry_put_object: true
   upload_cutoff: 0
