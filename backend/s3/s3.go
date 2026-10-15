@@ -1150,8 +1150,8 @@ type Options struct {
 	BucketObjectLockEnabled     bool                 `config:"bucket_object_lock_enabled"`
 	ObjectLockSetAfterUpload    bool                 `config:"object_lock_set_after_upload"`
 	ObjectLockSupported         fs.Tristate          `config:"object_lock_supported"`
-	retryOperationAborted       bool
-	retryPutObject              bool
+	retryOperationAborted       bool                 `config:"-"`
+	retryPutObject              bool                 `config:"-"`
 }
 
 // Fs represents a remote s3 server

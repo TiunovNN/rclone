@@ -10,8 +10,10 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/multipart"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/pool"
 	"golang.org/x/sync/errgroup"
 )
@@ -61,14 +63,71 @@ type multiThreadCopyState struct {
 	acc         *accounting.Account
 	numChunks   int
 	noBuffering bool // set to read the input without buffering
+	readSlots   chan struct{}
+	writeSlots  chan struct{}
+	readRetries int
+	retrySleep  time.Duration
+}
+
+// acquireSlot acquires a concurrency slot, returning false if the context ended.
+func acquireSlot(ctx context.Context, slots chan struct{}) bool {
+	select {
+	case slots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// readChunk reads a complete source range into memory, retrying transient failures.
+func (mc *multiThreadCopyState) readChunk(ctx context.Context, chunk int, start, end, size int64) (rw *pool.RW, err error) {
+	maxTries := max(mc.readRetries, 1)
+	for try := 1; try <= maxTries; try++ {
+		if !acquireSlot(ctx, mc.readSlots) {
+			return nil, ctx.Err()
+		}
+		rw = multipart.NewRW().Reserve(size)
+		err = func() (err error) {
+			defer func() { <-mc.readSlots }()
+			rc, openErr := Open(ctx, mc.src, &fs.RangeOption{Start: start, End: end - 1})
+			if openErr != nil {
+				return fmt.Errorf("multi-thread copy: failed to open source: %w", openErr)
+			}
+			_, err = io.CopyN(rw, rc, size)
+			if err != nil {
+				err = fmt.Errorf("multi-thread copy: failed to read chunk: %w", err)
+			}
+			fs.CheckClose(rc, &err)
+			return err
+		}()
+		if err == nil {
+			return rw, nil
+		}
+		_ = rw.Close()
+		rw = nil
+
+		if try >= maxTries || fserrors.IsFatalError(err) || fserrors.IsNoRetryError(err) {
+			return nil, err
+		}
+
+		retrySleep := mc.retrySleep
+		if retryAfter, ok := pacer.IsRetryAfter(err); ok {
+			retrySleep = retryAfter
+		} else if !fserrors.IsRetryError(err) && !fserrors.ShouldRetry(err) {
+			return nil, err
+		}
+
+		fs.LogfCtx(ctx, mc.src, "multi-thread copy: chunk %d/%d source read failed (attempt %d/%d), retrying: %v", chunk+1, mc.numChunks, try, maxTries, err)
+		if retrySleep > 0 && !sleepWithContext(ctx, retrySleep) {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, err
 }
 
 // Copy a single chunk into place
-func (mc *multiThreadCopyState) copyChunk(ctx context.Context, chunk int, writer fs.ChunkWriter, start, end, size int64, rw *pool.RW) (err error) {
+func (mc *multiThreadCopyState) copyChunk(ctx context.Context, chunk int, writer fs.ChunkWriter, start, end, size int64) (err error) {
 	defer func() {
-		if !mc.noBuffering {
-			fs.CheckClose(rw, &err)
-		}
 		if err != nil {
 			fs.DebugfCtx(ctx, mc.src, "multi-thread copy: chunk %d/%d failed: %v", chunk+1, mc.numChunks, err)
 		}
@@ -76,27 +135,31 @@ func (mc *multiThreadCopyState) copyChunk(ctx context.Context, chunk int, writer
 
 	fs.DebugfCtx(ctx, mc.src, "multi-thread copy: chunk %d/%d (%d-%d) size %v starting", chunk+1, mc.numChunks, start, end, fs.SizeSuffix(size))
 
-	rc, err := Open(ctx, mc.src, &fs.RangeOption{Start: start, End: end - 1})
-	if err != nil {
-		return fmt.Errorf("multi-thread copy: failed to open source: %w", err)
-	}
-	defer fs.CheckClose(rc, &err)
-
 	var rs io.ReadSeeker
 	if mc.noBuffering {
+		rc, err := Open(ctx, mc.src, &fs.RangeOption{Start: start, End: end - 1})
+		if err != nil {
+			return fmt.Errorf("multi-thread copy: failed to open source: %w", err)
+		}
+		defer fs.CheckClose(rc, &err)
 		// Read directly if we are sure we aren't going to seek
 		// and account with accounting
 		rc.SetAccounting(mc.acc.AccountRead)
 		rs = rc
 	} else {
-		// Read the chunk into buffered reader
-		_, err = io.CopyN(rw, rc, size)
+		rw, err := mc.readChunk(ctx, chunk, start, end, size)
 		if err != nil {
-			return fmt.Errorf("multi-thread copy: failed to read chunk: %w", err)
+			return err
 		}
+		defer fs.CheckClose(rw, &err)
 		// Account as we go
 		rw.SetAccounting(mc.acc.AccountRead)
 		rs = rw
+
+		if !acquireSlot(ctx, mc.writeSlots) {
+			return ctx.Err()
+		}
+		defer func() { <-mc.writeSlots }()
 	}
 
 	// Write the chunk
@@ -179,24 +242,34 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		info.ChunkSize = src.Size()
 	}
 
-	// Use the backend concurrency if it is higher than --multi-thread-streams or if --multi-thread-streams wasn't set explicitly
-	if !ci.MultiThreadSet || info.Concurrency > concurrency {
+	backendConcurrency := max(info.Concurrency, 1)
+	readConcurrency := max(concurrency, 1)
+
+	// Without an explicit source limit, match it to the backend write limit.
+	if !ci.MultiThreadSet {
 		fs.DebugfCtx(ctx, src, "multi-thread copy: using backend concurrency of %d instead of --multi-thread-streams %d", info.Concurrency, concurrency)
-		concurrency = info.Concurrency
+		readConcurrency = backendConcurrency
 	}
 
 	numChunks := calculateNumChunks(src.Size(), info.ChunkSize)
-	if concurrency > numChunks {
-		fs.DebugfCtx(ctx, src, "multi-thread copy: number of streams %d was bigger than number of chunks %d", concurrency, numChunks)
-		concurrency = numChunks
+	if readConcurrency > numChunks {
+		fs.DebugfCtx(ctx, src, "multi-thread copy: number of read streams %d was bigger than number of chunks %d", readConcurrency, numChunks)
+		readConcurrency = numChunks
 	}
-
-	if concurrency < 1 {
-		concurrency = 1
+	if backendConcurrency > numChunks {
+		backendConcurrency = numChunks
 	}
 
 	g, gCtx := errgroup.WithContext(uploadCtx)
-	g.SetLimit(concurrency)
+	workerConcurrency := readConcurrency
+	if noBuffering {
+		// Direct streaming couples the source read and destination write.
+		workerConcurrency = max(readConcurrency, backendConcurrency)
+	} else {
+		// Buffered chunks let source reads and destination writes make progress independently.
+		workerConcurrency = min(numChunks, readConcurrency+backendConcurrency)
+	}
+	g.SetLimit(workerConcurrency)
 
 	mc := &multiThreadCopyState{
 		ctx:         gCtx,
@@ -205,12 +278,22 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		partSize:    info.ChunkSize,
 		numChunks:   numChunks,
 		noBuffering: noBuffering,
+		readRetries: ci.Retries,
+		retrySleep:  time.Duration(ci.RetriesInterval),
+	}
+	if !noBuffering {
+		mc.readSlots = make(chan struct{}, readConcurrency)
+		mc.writeSlots = make(chan struct{}, backendConcurrency)
 	}
 
 	// Make accounting
 	mc.acc = tr.Account(gCtx, nil)
 
-	fs.DebugfCtx(ctx, src, "Starting multi-thread copy with %d chunks of size %v with %v parallel streams", mc.numChunks, fs.SizeSuffix(mc.partSize), concurrency)
+	if noBuffering {
+		fs.DebugfCtx(ctx, src, "Starting multi-thread copy with %d chunks of size %v with %v parallel streams", mc.numChunks, fs.SizeSuffix(mc.partSize), workerConcurrency)
+	} else {
+		fs.DebugfCtx(ctx, src, "Starting multi-thread copy with %d chunks of size %v with %d read streams and %d write streams", mc.numChunks, fs.SizeSuffix(mc.partSize), readConcurrency, backendConcurrency)
+	}
 	for chunk := range mc.numChunks {
 		// Fail fast, in case an errgroup managed function returns an error
 		if gCtx.Err() != nil {
@@ -225,15 +308,8 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		end := min(start+mc.partSize, mc.size)
 		size := end - start
 
-		// Reserve the memory first so we don't open the source and wait for memory buffers for ages
-		// This also avoids creating an excess of goroutines all waiting on memory.
-		var rw *pool.RW
-		if !mc.noBuffering {
-			rw = multipart.NewRW().Reserve(size)
-		}
-
 		g.Go(func() error {
-			return mc.copyChunk(gCtx, chunk, chunkWriter, start, end, size, rw)
+			return mc.copyChunk(gCtx, chunk, chunkWriter, start, end, size)
 		})
 	}
 

@@ -468,7 +468,7 @@ var ConfigOptionsInfo = Options{{
 }, {
 	Name:    "multi_thread_streams",
 	Default: 4,
-	Help:    "Number of streams to use for multi-thread downloads",
+	Help:    "Number of source read streams to use for multi-thread transfers",
 	Groups:  "Copy",
 }, {
 	Name:    "multi_thread_write_buffer_size",

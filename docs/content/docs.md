@@ -2393,12 +2393,12 @@ Multi thread transfers will be used with `rclone mount` and `rclone serve`
 if `--vfs-cache-mode` is set to `writes` or above.
 
 Most multi-thread transfers do not take additional memory, but some do
-(for example uploading to s3). In the worst case memory usage can be
-at maximum `--transfers` \* `--multi-thread-chunk-size` \*
-`--multi-thread-streams` or specifically for the s3 backend
-`--transfers` \* `--s3-chunk-size` \* `--s3-concurrency`. However you
-can use the [--max-buffer-memory](/docs/#max-buffer-memory) flag
-to control the maximum memory used here.
+(for example uploading to s3). Buffered remote-to-remote transfers use
+separate read and write workers. In the worst case memory usage can be
+at maximum `--transfers` \* chunk size \*
+(`--multi-thread-streams` + backend upload concurrency). However you can use
+the [--max-buffer-memory](/docs/#max-buffer-memory) flag to control the
+maximum memory used here.
 
 **NB** that this **only** works with supported backends as the
 destination but will work with any backend as the source.
@@ -2416,13 +2416,19 @@ with `--multi-thread-streams 0`
 ### --multi-thread-streams int
 
 When using multi thread transfers (see above `--multi-thread-cutoff`)
-this sets the number of streams to use. Set to `0` to disable multi
-thread transfers (Default 4).
+this sets the number of streams used to read from the source. Set to `0`
+to disable multi thread transfers (Default 4).
 
 If the backend has a `--backend-upload-concurrency` setting (eg
-`--s3-upload-concurrency`) then this setting will be used as the
-number of transfers instead if it is larger than the value of
-`--multi-thread-streams` or `--multi-thread-streams` isn't set.
+`--s3-upload-concurrency`) then that controls concurrent destination
+writes. For buffered remote-to-remote transfers, reads and writes run
+independently. If `--multi-thread-streams` isn't set explicitly, the
+backend upload concurrency is also used for source reads.
+
+For buffered remote-to-remote transfers, a transient source error retries only
+the failed range, up to `--retries` attempts and using `--retries-sleep`
+between attempts. Parts which have already reached the destination remain in
+the active multipart upload.
 
 ### --name-transform stringArray
 

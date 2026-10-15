@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -402,4 +403,170 @@ func TestMultithreadCopyWriterAtErrors(t *testing.T) {
 			})
 		}
 	}
+}
+
+type testChunkWriter struct {
+	mu           sync.Mutex
+	chunks       map[int][]byte
+	active       atomic.Int32
+	maxActive    atomic.Int32
+	writes       atomic.Int32
+	writesReady  chan struct{}
+	releaseWrite chan struct{}
+}
+
+func (w *testChunkWriter) WriteChunk(_ context.Context, chunk int, reader io.ReadSeeker) (int64, error) {
+	active := w.active.Add(1)
+	defer w.active.Add(-1)
+	for {
+		old := w.maxActive.Load()
+		if active <= old || w.maxActive.CompareAndSwap(old, active) {
+			break
+		}
+	}
+	if w.writes.Add(1) == 4 && w.writesReady != nil {
+		close(w.writesReady)
+	}
+	if w.releaseWrite != nil {
+		<-w.releaseWrite
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return 0, err
+	}
+	w.mu.Lock()
+	if w.chunks == nil {
+		w.chunks = map[int][]byte{}
+	}
+	w.chunks[chunk] = data
+	w.mu.Unlock()
+	return int64(len(data)), nil
+}
+
+func (w *testChunkWriter) Close(context.Context) error { return nil }
+func (w *testChunkWriter) Abort(context.Context) error { return nil }
+
+type flakyRangeObject struct {
+	fs.Object
+	failStart int64
+	attempts  atomic.Int32
+}
+
+func (o *flakyRangeObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	for _, option := range options {
+		if rangeOption, ok := option.(*fs.RangeOption); ok && rangeOption.Start == o.failStart {
+			if o.attempts.Add(1) == 1 {
+				return nil, fserrors.RetryError(errors.New("temporary source failure"))
+			}
+		}
+	}
+	return o.Object.Open(ctx, options...)
+}
+
+type blockingRangeObject struct {
+	fs.Object
+	active       atomic.Int32
+	maxActive    atomic.Int32
+	readsReady   chan struct{}
+	readsOnce    sync.Once
+	releaseReads chan struct{}
+}
+
+func (o *blockingRangeObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	active := o.active.Add(1)
+	defer o.active.Add(-1)
+	for {
+		old := o.maxActive.Load()
+		if active <= old || o.maxActive.CompareAndSwap(old, active) {
+			break
+		}
+	}
+	if active >= 2 {
+		o.readsOnce.Do(func() { close(o.readsReady) })
+	}
+	select {
+	case <-o.releaseReads:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return o.Object.Open(ctx, options...)
+}
+
+func newMultiThreadTest(t *testing.T, content []byte, chunkSize int64, backendConcurrency int) (context.Context, fs.Fs, *mockobject.ContentMockObject, *testChunkWriter) {
+	t.Helper()
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 1
+	ci.Retries = 2
+	ci.RetriesInterval = 0
+	ci.MultiThreadStreams = 2
+	ci.MultiThreadSet = true
+
+	srcFs, err := mockfs.NewFs(ctx, "source", "", nil)
+	require.NoError(t, err)
+	src := mockobject.New("source.bin").WithContent(content, mockobject.SeekModeNone)
+	src.SetFs(srcFs)
+
+	dstFs, err := mockfs.NewFs(ctx, "destination", "", nil)
+	require.NoError(t, err)
+	dst := mockobject.New("destination.bin").WithContent(content, mockobject.SeekModeNone)
+	dstFs.(*mockfs.Fs).AddObject(dst)
+
+	writer := &testChunkWriter{}
+	dstFs.Features().OpenChunkWriter = func(context.Context, string, fs.ObjectInfo, ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+		return fs.ChunkWriterInfo{ChunkSize: chunkSize, Concurrency: backendConcurrency}, writer, nil
+	}
+	return ctx, dstFs, src, writer
+}
+
+func TestMultithreadCopyRetriesFailedSourceChunk(t *testing.T) {
+	content := []byte("0123456789ab")
+	ctx, dstFs, src, writer := newMultiThreadTest(t, content, 4, 2)
+	flaky := &flakyRangeObject{Object: src, failStart: 4}
+	tr := accounting.GlobalStats().NewTransfer(flaky, nil)
+
+	dst, err := multiThreadCopy(ctx, dstFs, "destination.bin", flaky, 2, tr)
+	tr.Done(ctx, err)
+	require.NoError(t, err)
+	require.NotNil(t, dst)
+	assert.Equal(t, int32(2), flaky.attempts.Load())
+	assert.Equal(t, []byte("4567"), writer.chunks[1])
+}
+
+func TestMultithreadCopySeparatesReadAndWriteConcurrency(t *testing.T) {
+	content := []byte("0123456789abcdef")
+	ctx, dstFs, src, writer := newMultiThreadTest(t, content, 4, 4)
+	readsReady := make(chan struct{})
+	releaseReads := make(chan struct{})
+	blocking := &blockingRangeObject{
+		Object:       src,
+		readsReady:   readsReady,
+		releaseReads: releaseReads,
+	}
+	writer.writesReady = make(chan struct{})
+	writer.releaseWrite = make(chan struct{})
+	tr := accounting.GlobalStats().NewTransfer(blocking, nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := multiThreadCopy(ctx, dstFs, "destination.bin", blocking, 2, tr)
+		tr.Done(ctx, err)
+		done <- err
+	}()
+
+	select {
+	case <-readsReady:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for source reads")
+	}
+	time.Sleep(20 * time.Millisecond)
+	assert.LessOrEqual(t, blocking.maxActive.Load(), int32(2), "backend upload concurrency must not increase source read concurrency")
+	close(releaseReads)
+
+	select {
+	case <-writer.writesReady:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for concurrent destination writes")
+	}
+	assert.Equal(t, int32(4), writer.maxActive.Load())
+	close(writer.releaseWrite)
+	require.NoError(t, <-done)
 }

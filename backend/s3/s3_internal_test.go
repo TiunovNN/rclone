@@ -25,6 +25,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/chunksize"
+	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
@@ -93,6 +94,15 @@ func TestSelectelQuirks(t *testing.T) {
 		assert.Greater(t, got, selectelChunkSize)
 		assert.LessOrEqual(t, parts, int64(maxUploadParts))
 	})
+}
+
+func TestOptionsConfigStructSkipsInternalRetryFlags(t *testing.T) {
+	items, err := configstruct.Items(&Options{})
+	require.NoError(t, err)
+	for _, item := range items {
+		assert.NotEqual(t, "retry_operation_aborted", item.Name)
+		assert.NotEqual(t, "retry_put_object", item.Name)
+	}
 }
 
 func TestShouldRetryOperationAborted(t *testing.T) {
