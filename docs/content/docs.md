@@ -2427,17 +2427,20 @@ backend upload concurrency is also used for source reads.
 
 For buffered remote-to-remote transfers, a transient source error retries only
 the failed range, up to `--multi-thread-read-retries` attempts and using
-`--retries-sleep` between attempts. Set `--multi-thread-read-retries 0` to use
-`--retries` as the limit. Each range attempt also uses the source backend's
-low-level retries. Parts which have already reached the destination remain in
-the active multipart upload.
+`--retries-sleep` between attempts. Parts which have already reached the
+destination remain in the active multipart upload. The same setting limits
+source open and read attempts for single-stream transfers. Set
+`--multi-thread-read-retries 0` to use `--retries` as the limit. Each attempt
+also uses the source backend's low-level retries.
 
 ### --multi-thread-read-retries int
 
-This sets the number of attempts to read each source chunk during a buffered
-multi-thread transfer. Increasing it lets an active multipart upload survive a
-longer source outage without discarding parts already uploaded to the
-destination. The default `0` uses `--retries`.
+This sets the number of attempts to read source data. During a buffered
+multi-thread transfer it applies independently to each source chunk, allowing
+an active multipart upload to survive a longer source outage without
+discarding parts already uploaded to the destination. It also applies to
+source open and read failures during single-stream transfers. The default `0`
+uses `--retries`.
 
 ### --name-transform stringArray
 

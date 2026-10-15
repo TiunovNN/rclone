@@ -25,6 +25,7 @@ func TestNewFilterDefault(t *testing.T) {
 	assert.Len(t, f.dirRules.rules, 0)
 	assert.Len(t, f.metaRules.rules, 0)
 	assert.Nil(t, f.files)
+	assert.Nil(t, f.excluded)
 	assert.True(t, f.InActive())
 }
 
@@ -174,6 +175,25 @@ func TestNewFilterWithFilesFromRaw(t *testing.T) {
 			t.Errorf("Didn't find file %q in f.files", name)
 		}
 	}
+}
+
+func TestNewFilterWithExactExcludes(t *testing.T) {
+	Opt := Opt
+	rawFile := testFile(t, "literal[1].mp4\n#not-a-comment\n spaced name \n")
+	nulFile := testFile(t, "line\nbreak.mp4\x00brace{1}.jpg\x00")
+	Opt.ExcludeFromRaw = []string{rawFile}
+	Opt.ExcludeFrom0 = []string{nulFile}
+	defer os.Remove(rawFile)
+	defer os.Remove(nulFile)
+
+	f, err := NewFilter(&Opt)
+	require.NoError(t, err)
+	assert.False(t, f.InActive())
+	for _, name := range []string{"literal[1].mp4", "#not-a-comment", " spaced name ", "line\nbreak.mp4", "brace{1}.jpg"} {
+		assert.False(t, f.IncludeRemote(name), name)
+	}
+	assert.True(t, f.IncludeRemote("literal1.mp4"))
+	assert.True(t, f.IncludeRemote("brace1.jpg"))
 }
 
 func TestNewFilterForbiddenMixOfFilesFrom0AndFilterRule(t *testing.T) {

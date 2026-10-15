@@ -25,20 +25,33 @@ import (
 
 // State of the copy
 type copy struct {
-	f             fs.Fs                // destination fs.Fs
-	dstFeatures   *fs.Features         // Features() for fs.Fs
-	dst           fs.Object            // destination object to update, may be nil
-	remote        string               // destination path, used if dst is nil
-	src           fs.Object            // source object
-	ci            *fs.ConfigInfo       // current config
-	maxTries      int                  // max number of tries to do the copy
-	doUpdate      bool                 // whether we are updating an existing file or not
-	hashType      hash.Type            // common hash to use
-	hashOption    *fs.HashesOption     // open option for the common hash
-	tr            *accounting.Transfer // accounting for the transfer
-	inplace       bool                 // set if we are updating inplace and not using a partial name
-	remoteForCopy string               // the name used for the transfer, either remote or remote+".partial"
+	f               fs.Fs                // destination fs.Fs
+	dstFeatures     *fs.Features         // Features() for fs.Fs
+	dst             fs.Object            // destination object to update, may be nil
+	remote          string               // destination path, used if dst is nil
+	src             fs.Object            // source object
+	ci              *fs.ConfigInfo       // current config
+	maxTries        int                  // max number of tries to do the copy
+	sourceReadTries int                  // max number of attempts for source read failures
+	doUpdate        bool                 // whether we are updating an existing file or not
+	hashType        hash.Type            // common hash to use
+	hashOption      *fs.HashesOption     // open option for the common hash
+	tr              *accounting.Transfer // accounting for the transfer
+	inplace         bool                 // set if we are updating inplace and not using a partial name
+	remoteForCopy   string               // the name used for the transfer, either remote or remote+".partial"
 }
+
+// sourceReadError identifies failures opening or reading the source. This lets
+// the copy retry loop distinguish an exhausted source from destination upload
+// failures.
+type sourceReadError struct {
+	err error
+}
+
+func (e *sourceReadError) Error() string {
+	return fmt.Sprintf("failed to read source object: %v", e.err)
+}
+func (e *sourceReadError) Unwrap() error { return e.err }
 
 // Used to remove a failed copy
 func (c *copy) removeFailedCopy(ctx context.Context, o fs.Object) {
@@ -273,17 +286,21 @@ func (c *copy) manualCopy(ctx context.Context) (actionTaken string, newDst fs.Ob
 		c.tr.Reset(ctx)
 	}
 
-	var in io.ReadCloser
+	var in *ReOpen
 	in, err = Open(ctx, c.src, downloadOptions...)
 	if err != nil {
-		return actionTaken, nil, fmt.Errorf("failed to open source object: %w", err)
+		return actionTaken, nil, &sourceReadError{err: err}
 	}
 
 	// Note that c.rcat and c.updateOrPut close in
 	if c.src.Size() == -1 {
 		return c.rcat(ctx, in)
 	}
-	return c.updateOrPut(ctx, in, uploadOptions)
+	actionTaken, newDst, err = c.updateOrPut(ctx, in, uploadOptions)
+	if readErr := in.SourceReadError(); readErr != nil {
+		return actionTaken, newDst, &sourceReadError{err: readErr}
+	}
+	return actionTaken, newDst, err
 }
 
 // Verify the copy
@@ -311,7 +328,7 @@ func (c *copy) verify(ctx context.Context, newDst fs.Object) (err error) {
 func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	var actionTaken string
 	retry := true
-	for tries := 0; retry && tries < c.maxTries; tries++ {
+	for tries := 0; retry && tries < max(c.maxTries, c.sourceReadTries); tries++ {
 		// Check we haven't hit any accounting limits
 		err = c.checkLimits(ctx)
 		if err != nil {
@@ -331,11 +348,20 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 			break
 		}
 
-		// Retry if err returned a retry error
+		var sourceErr *sourceReadError
+		isSourceReadError := err != nil && errors.As(err, &sourceErr)
+		maxTries := c.maxTries
+		if isSourceReadError {
+			maxTries = c.sourceReadTries
+		}
+
+		// Retry if err returned a retry error and this error class still has
+		// attempts remaining.
 		retry = false
-		if fserrors.IsRetryError(err) || fserrors.ShouldRetry(err) {
+		isRetryError := fserrors.IsRetryError(err) || fserrors.ShouldRetry(err)
+		if isRetryError && tries+1 < maxTries {
 			retry = true
-		} else if t, ok := pacer.IsRetryAfter(err); ok && tries+1 < c.maxTries {
+		} else if t, ok := pacer.IsRetryAfter(err); ok && tries+1 < maxTries {
 			fs.DebugfCtx(ctx, c.src, "Sleeping for %v (as indicated by the server) to obey Retry-After error: %v", t, err)
 			if sleepWithContext(ctx, t) {
 				retry = true
@@ -343,8 +369,13 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 				fserrors.ContextError(ctx, &err)
 			}
 		}
+		if isSourceReadError && isRetryError && tries+1 >= maxTries {
+			exhaustedErr := fmt.Errorf("copy: source read retries exhausted after %d attempts: %v", tries+1, err)
+			err = fserrors.NoLowLevelRetryError(fserrors.NoRetryError(exhaustedErr))
+			retry = false
+		}
 		if retry {
-			fs.DebugfCtx(ctx, c.src, "Received error: %v - low level retry %d/%d", err, tries+1, c.maxTries)
+			fs.DebugfCtx(ctx, c.src, "Received error: %v - low level retry %d/%d", err, tries+1, maxTries)
 			c.tr.Reset(ctx) // skip incomplete accounting - will be overwritten by retry
 			continue
 		}
@@ -396,6 +427,11 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 // be nil.
 func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Object) (newDst fs.Object, err error) {
 	ci := fs.GetConfig(ctx)
+	sourceReadTries := ci.MultiThreadReadRetries
+	if sourceReadTries <= 0 {
+		sourceReadTries = ci.Retries
+	}
+	sourceReadTries = max(sourceReadTries, 1)
 	tr := accounting.Stats(ctx).NewTransfer(src, f)
 	defer func() {
 		tr.Done(ctx, err)
@@ -406,15 +442,16 @@ func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Obj
 		return newDst, nil
 	}
 	c := &copy{
-		f:           f,
-		dstFeatures: f.Features(),
-		dst:         dst,
-		remote:      transform.Path(ctx, remote, false),
-		src:         src,
-		ci:          ci,
-		tr:          tr,
-		maxTries:    ci.LowLevelRetries,
-		doUpdate:    dst != nil,
+		f:               f,
+		dstFeatures:     f.Features(),
+		dst:             dst,
+		remote:          transform.Path(ctx, remote, false),
+		src:             src,
+		ci:              ci,
+		tr:              tr,
+		maxTries:        ci.LowLevelRetries,
+		sourceReadTries: sourceReadTries,
+		doUpdate:        dst != nil,
 	}
 	c.hashType, c.hashOption = CommonHash(ctx, f, src.Fs())
 	if c.dst != nil {

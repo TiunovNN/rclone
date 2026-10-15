@@ -453,6 +453,51 @@ type flakyRangeObject struct {
 	attempts  atomic.Int32
 }
 
+type failingOpenObject struct {
+	fs.Object
+	attempts atomic.Int32
+	err      error
+}
+
+type failingReadObject struct {
+	fs.Object
+	attempts atomic.Int32
+}
+
+type retryingErrorReadCloser struct {
+	io.ReadCloser
+}
+
+type readingPutFs struct {
+	fs.Fs
+}
+
+func (r retryingErrorReadCloser) Read([]byte) (int, error) {
+	return 0, fserrors.RetryError(errors.New("temporary source read failure"))
+}
+
+func (f *readingPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	_, err := io.Copy(io.Discard, in)
+	return nil, err
+}
+
+func (o *failingOpenObject) Open(context.Context, ...fs.OpenOption) (io.ReadCloser, error) {
+	o.attempts.Add(1)
+	if o.err != nil {
+		return nil, o.err
+	}
+	return nil, fserrors.RetryError(errors.New("temporary source open failure"))
+}
+
+func (o *failingReadObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	o.attempts.Add(1)
+	rc, err := o.Object.Open(ctx, options...)
+	if err != nil {
+		return nil, err
+	}
+	return retryingErrorReadCloser{ReadCloser: rc}, nil
+}
+
 func (o *flakyRangeObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	for _, option := range options {
 		if rangeOption, ok := option.(*fs.RangeOption); ok && rangeOption.Start == o.failStart {
@@ -550,6 +595,84 @@ func TestMultithreadCopyUsesDedicatedSourceReadRetries(t *testing.T) {
 	assert.Equal(t, int32(4), flaky.attempts.Load())
 	assert.Equal(t, int32(3), writer.writes.Load())
 	assert.Equal(t, []byte("4567"), writer.chunks[1])
+}
+
+func TestMultithreadCopyExhaustedSourceReadIsNotRetriedAtCommandLevel(t *testing.T) {
+	content := []byte("0123456789ab")
+	ctx, dstFs, src, _ := newMultiThreadTest(t, content, 4, 2)
+	ci := fs.GetConfig(ctx)
+	ci.MultiThreadReadRetries = 3
+	flaky := &flakyRangeObject{Object: src, failStart: 4, failures: 100}
+	tr := accounting.GlobalStats().NewTransfer(flaky, nil)
+
+	_, err := multiThreadCopy(ctx, dstFs, "destination.bin", flaky, 2, tr)
+	tr.Done(ctx, err)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoRetryError(err))
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err))
+	assert.ErrorContains(t, err, "source read retries exhausted for chunk 2/3 after 3 attempts")
+	assert.Equal(t, int32(3), flaky.attempts.Load())
+}
+
+func TestCopyExhaustedSourceOpenIsNotRetriedAtCommandLevel(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 3
+	ci.MultiThreadStreams = 0
+	srcFs, err := mockfs.NewFs(ctx, "source", "", nil)
+	require.NoError(t, err)
+	src := mockobject.New("source.bin").WithContent([]byte("content"), mockobject.SeekModeNone)
+	src.SetFs(srcFs)
+	failing := &failingOpenObject{Object: src}
+	dstFs, err := mockfs.NewFs(ctx, "destination", "", nil)
+	require.NoError(t, err)
+
+	_, err = Copy(ctx, dstFs, nil, "destination.bin", failing)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoRetryError(err))
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err))
+	assert.ErrorContains(t, err, "source read retries exhausted after 3 attempts")
+	assert.Equal(t, int32(3), failing.attempts.Load())
+}
+
+func TestCopyExhaustedMidStreamSourceReadUsesDedicatedRetryLimit(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 1
+	ci.MultiThreadReadRetries = 10
+	ci.MultiThreadStreams = 0
+	ci.RetriesInterval = 0
+	srcFs, err := mockfs.NewFs(ctx, "source", "", nil)
+	require.NoError(t, err)
+	src := mockobject.New("source.bin").WithContent([]byte("content"), mockobject.SeekModeNone)
+	src.SetFs(srcFs)
+	failing := &failingReadObject{Object: src}
+	dstFsBase, err := mockfs.NewFs(ctx, "destination", "", nil)
+	require.NoError(t, err)
+	dstFs := &readingPutFs{Fs: dstFsBase}
+
+	_, err = Copy(ctx, dstFs, nil, "destination.bin", failing)
+	require.Error(t, err)
+	assert.True(t, fserrors.IsNoRetryError(err))
+	assert.True(t, fserrors.IsNoLowLevelRetryError(err))
+	assert.ErrorContains(t, err, "source read retries exhausted after 10 attempts")
+	assert.Equal(t, int32(10), failing.attempts.Load())
+}
+
+func TestCopyPermanentSourceOpenErrorIsNotQuarantinable(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 3
+	ci.MultiThreadStreams = 0
+	srcFs, err := mockfs.NewFs(ctx, "source", "", nil)
+	require.NoError(t, err)
+	src := mockobject.New("source.bin").WithContent([]byte("content"), mockobject.SeekModeNone)
+	src.SetFs(srcFs)
+	failing := &failingOpenObject{Object: src, err: errors.New("permanent source open failure")}
+	dstFs, err := mockfs.NewFs(ctx, "destination", "", nil)
+	require.NoError(t, err)
+
+	_, err = Copy(ctx, dstFs, nil, "destination.bin", failing)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "source read retries exhausted")
+	assert.Equal(t, int32(1), failing.attempts.Load())
 }
 
 func TestMultithreadCopySeparatesReadAndWriteConcurrency(t *testing.T) {

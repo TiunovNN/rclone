@@ -51,6 +51,16 @@ var OptionsInfo = fs.Options{{
 	Help:    "Read list of source-file names from file using NUL as separator (use - to read from stdin)",
 	Groups:  "Filter",
 }, {
+	Name:    "exclude_from_raw",
+	Default: []string{},
+	Help:    "Read exact source-file names to exclude without processing (use - to read from stdin)",
+	Groups:  "Filter",
+}, {
+	Name:    "exclude_from0",
+	Default: []string{},
+	Help:    "Read exact source-file names to exclude using NUL as separator (use - to read from stdin)",
+	Groups:  "Filter",
+}, {
 	Name:    "min_age",
 	Default: fs.DurationOff,
 	Help:    "Only transfer files older than this in s or suffix ms|s|m|h|d|w|M|y",
@@ -151,6 +161,8 @@ type Options struct {
 	FilesFrom      []string      `config:"files_from"`
 	FilesFromRaw   []string      `config:"files_from_raw"`
 	FilesFrom0     []string      `config:"files_from0"`
+	ExcludeFromRaw []string      `config:"exclude_from_raw"`
+	ExcludeFrom0   []string      `config:"exclude_from0"`
 	MetaRules      RulesOpt      `config:"metadata"`
 	MinAge         fs.Duration   `config:"min_age"`
 	MaxAge         fs.Duration   `config:"max_age"`
@@ -185,6 +197,7 @@ type Filter struct {
 	metaRules   rules
 	files       FilesMap // files if filesFrom
 	dirs        FilesMap // dirs from filesFrom
+	excluded    FilesMap // exact file names excluded by exclude-from-raw/exclude-from0
 	hashFilterN uint64   // if non 0 do hash filtering
 	hashFilterK uint64   // select partition K/N
 }
@@ -265,6 +278,28 @@ func NewFilter(opt *Options) (f *Filter, err error) {
 		f.initAddFile() // init to show --files-from set even if no files within
 		err := forEachLine(rule, true, true, func(line string) error {
 			return f.AddFile(line)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, rule := range f.Opt.ExcludeFromRaw {
+		f.initAddExcludedFile()
+		err := forEachLine(rule, true, false, func(line string) error {
+			f.AddExcludedFile(line)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, rule := range f.Opt.ExcludeFrom0 {
+		f.initAddExcludedFile()
+		err := forEachLine(rule, true, true, func(line string) error {
+			f.AddExcludedFile(line)
+			return nil
 		})
 		if err != nil {
 			return nil, err
@@ -405,6 +440,26 @@ func (f *Filter) AddFile(file string) error {
 	return nil
 }
 
+// initAddExcludedFile initializes the exact exclusion map.
+func (f *Filter) initAddExcludedFile() {
+	if f.excluded == nil {
+		f.excluded = make(FilesMap)
+	}
+}
+
+// AddExcludedFile adds a literal path to the exact exclusion map.
+func (f *Filter) AddExcludedFile(file string) {
+	f.initAddExcludedFile()
+	file = strings.Trim(file, "/")
+	f.excluded[file] = struct{}{}
+}
+
+// isExcluded reports whether remote is in the exact exclusion map.
+func (f *Filter) isExcluded(remote string) bool {
+	_, excluded := f.excluded[remote]
+	return excluded
+}
+
 // Files returns all the files from the `--files-from` list
 //
 // It may be nil if the list is empty
@@ -422,6 +477,7 @@ func (f *Filter) Clear() {
 // InActive returns false if any filters are active
 func (f *Filter) InActive() bool {
 	return (f.files == nil &&
+		f.excluded == nil &&
 		f.ModTimeFrom.IsZero() &&
 		f.ModTimeTo.IsZero() &&
 		f.Opt.MinSize < 0 &&
@@ -435,6 +491,9 @@ func (f *Filter) InActive() bool {
 
 // IncludeRemote returns whether this remote passes the filter rules.
 func (f *Filter) IncludeRemote(remote string) bool {
+	if f.isExcluded(remote) {
+		return false
+	}
 	// filesFrom takes precedence
 	if f.files != nil {
 		_, include := f.files[remote]
@@ -521,6 +580,10 @@ func (f *Filter) DirContainsExcludeFile(ctx context.Context, fremote fs.Fs, remo
 // Include returns whether this object should be included into the
 // sync or not and logs the reason for exclusion if not included
 func (f *Filter) Include(remote string, size int64, modTime time.Time, metadata fs.Metadata) bool {
+	if f.isExcluded(remote) {
+		fs.Debugf(remote, "Excluded (Exact Path Filter)")
+		return false
+	}
 	// filesFrom takes precedence
 	if f.files != nil {
 		_, include := f.files[remote]

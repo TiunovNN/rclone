@@ -34,6 +34,7 @@ type ReOpen struct {
 	maxTries    int             // maximum number of retries
 	tries       int             // number of retries we've had so far in this stream
 	err         error           // if this is set then Read/Close calls will return it
+	readErr     error           // terminal error returned by the source stream
 	opened      bool            // if set then rc is valid and needs closing
 	account     AccountFn       // account for a read
 	reads       int             // count how many times the data has been read
@@ -219,6 +220,9 @@ func (h *ReOpen) Read(p []byte) (n int, err error) {
 					err = nil
 				}
 			}
+			if err != nil {
+				h.readErr = err
+			}
 		}
 	}
 	// Count a read of the data if we read from the start successfully
@@ -231,6 +235,15 @@ func (h *ReOpen) Read(p []byte) (n int, err error) {
 		err = accErr
 	}
 	return n, err
+}
+
+// SourceReadError returns the terminal error returned while reading the
+// source. It remains available after Close so callers can distinguish a
+// broken source stream from an error writing to the destination.
+func (h *ReOpen) SourceReadError() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.readErr
 }
 
 // ReadAt reads len(p) bytes at absolute offset off without changing

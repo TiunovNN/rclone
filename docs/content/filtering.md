@@ -445,6 +445,13 @@ are applied to an rclone command.
 
 `--exclude-from` followed by `-` reads filter rules from standard input.
 
+### `--exclude-from-raw` - Read exact source-file names to exclude
+
+This flag excludes literal source-file names read from a file, without treating
+glob metacharacters, leading whitespace, `#`, or `;` specially. It can be
+combined with other filters. Use `--exclude-from0` for NUL-separated names,
+including names which contain newlines.
+
 ### `--include` - Include files matching pattern
 
 Adds a single include rule based on path/file names to an rclone

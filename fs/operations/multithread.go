@@ -106,10 +106,16 @@ func (mc *multiThreadCopyState) readChunk(ctx context.Context, chunk int, start,
 		_ = rw.Close()
 		rw = nil
 
-		if try >= maxTries || fserrors.IsFatalError(err) || fserrors.IsNoRetryError(err) {
+		if fserrors.IsFatalError(err) || fserrors.IsNoRetryError(err) || fserrors.IsNoLowLevelRetryError(err) {
 			return nil, err
 		}
-
+		if try >= maxTries {
+			// The range has already had its dedicated retries.  Do not let the
+			// command-level retry loop restart the complete object: callers can
+			// quarantine this object and retry it separately instead.
+			exhaustedErr := fmt.Errorf("multi-thread copy: source read retries exhausted for chunk %d/%d after %d attempts: %v", chunk+1, mc.numChunks, maxTries, err)
+			return nil, fserrors.NoLowLevelRetryError(fserrors.NoRetryError(exhaustedErr))
+		}
 		retrySleep := mc.retrySleep
 		if retryAfter, ok := pacer.IsRetryAfter(err); ok {
 			retrySleep = retryAfter

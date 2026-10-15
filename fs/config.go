@@ -473,11 +473,12 @@ var ConfigOptionsInfo = Options{{
 }, {
 	Name:    "multi_thread_read_retries",
 	Default: 0,
-	Help: `Number of attempts to read each source chunk during multi-thread transfers.
+	Help: `Number of attempts to read source data before giving up.
 
-Each attempt also uses the backend low-level retries. Set to 0 to use
---retries. Increasing this keeps completed destination parts in the active
-multipart upload while a transient source error is retried.`,
+For multi-thread transfers this retries only the failed chunk and keeps
+completed destination parts in the active multipart upload. For single-stream
+transfers this also limits retries after source open and read failures. Each
+attempt uses the backend low-level retries. Set to 0 to use --retries.`,
 	Groups: "Copy",
 }, {
 	Name:    "multi_thread_write_buffer_size",
