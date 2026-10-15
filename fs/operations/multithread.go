@@ -259,6 +259,10 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 	if backendConcurrency > numChunks {
 		backendConcurrency = numChunks
 	}
+	readRetries := ci.MultiThreadReadRetries
+	if readRetries <= 0 {
+		readRetries = ci.Retries
+	}
 
 	g, gCtx := errgroup.WithContext(uploadCtx)
 	workerConcurrency := readConcurrency
@@ -278,7 +282,7 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		partSize:    info.ChunkSize,
 		numChunks:   numChunks,
 		noBuffering: noBuffering,
-		readRetries: ci.Retries,
+		readRetries: readRetries,
 		retrySleep:  time.Duration(ci.RetriesInterval),
 	}
 	if !noBuffering {

@@ -449,13 +449,14 @@ func (w *testChunkWriter) Abort(context.Context) error { return nil }
 type flakyRangeObject struct {
 	fs.Object
 	failStart int64
+	failures  int32
 	attempts  atomic.Int32
 }
 
 func (o *flakyRangeObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	for _, option := range options {
 		if rangeOption, ok := option.(*fs.RangeOption); ok && rangeOption.Start == o.failStart {
-			if o.attempts.Add(1) == 1 {
+			if o.attempts.Add(1) <= max(o.failures, 1) {
 				return nil, fserrors.RetryError(errors.New("temporary source failure"))
 			}
 		}
@@ -498,6 +499,7 @@ func newMultiThreadTest(t *testing.T, content []byte, chunkSize int64, backendCo
 	ci.LowLevelRetries = 1
 	ci.Retries = 2
 	ci.RetriesInterval = 0
+	ci.MultiThreadReadRetries = 0
 	ci.MultiThreadStreams = 2
 	ci.MultiThreadSet = true
 
@@ -529,6 +531,24 @@ func TestMultithreadCopyRetriesFailedSourceChunk(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, dst)
 	assert.Equal(t, int32(2), flaky.attempts.Load())
+	assert.Equal(t, []byte("4567"), writer.chunks[1])
+}
+
+func TestMultithreadCopyUsesDedicatedSourceReadRetries(t *testing.T) {
+	content := []byte("0123456789ab")
+	ctx, dstFs, src, writer := newMultiThreadTest(t, content, 4, 2)
+	ci := fs.GetConfig(ctx)
+	ci.Retries = 1
+	ci.MultiThreadReadRetries = 4
+	flaky := &flakyRangeObject{Object: src, failStart: 4, failures: 3}
+	tr := accounting.GlobalStats().NewTransfer(flaky, nil)
+
+	dst, err := multiThreadCopy(ctx, dstFs, "destination.bin", flaky, 2, tr)
+	tr.Done(ctx, err)
+	require.NoError(t, err)
+	require.NotNil(t, dst)
+	assert.Equal(t, int32(4), flaky.attempts.Load())
+	assert.Equal(t, int32(3), writer.writes.Load())
 	assert.Equal(t, []byte("4567"), writer.chunks[1])
 }
 

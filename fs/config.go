@@ -471,6 +471,15 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Number of source read streams to use for multi-thread transfers",
 	Groups:  "Copy",
 }, {
+	Name:    "multi_thread_read_retries",
+	Default: 0,
+	Help: `Number of attempts to read each source chunk during multi-thread transfers.
+
+Each attempt also uses the backend low-level retries. Set to 0 to use
+--retries. Increasing this keeps completed destination parts in the active
+multipart upload while a transient source error is retried.`,
+	Groups: "Copy",
+}, {
 	Name:    "multi_thread_write_buffer_size",
 	Default: SizeSuffix(128 * 1024),
 	Help:    "In memory buffer size for writing when in multi-thread mode",
@@ -669,6 +678,7 @@ type ConfigInfo struct {
 	ClientPass                 string            `config:"client_pass"` // Client Side Key Password (obscured)
 	MultiThreadCutoff          SizeSuffix        `config:"multi_thread_cutoff"`
 	MultiThreadStreams         int               `config:"multi_thread_streams"`
+	MultiThreadReadRetries     int               `config:"multi_thread_read_retries"`
 	MultiThreadSet             bool              `config:"multi_thread_set"`        // whether MultiThreadStreams was set (set in fs/config/configflags)
 	MultiThreadChunkSize       SizeSuffix        `config:"multi_thread_chunk_size"` // Chunk size for multi-thread downloads / uploads, if not set by filesystem
 	MultiThreadWriteBufferSize SizeSuffix        `config:"multi_thread_write_buffer_size"`
